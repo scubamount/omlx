@@ -348,7 +348,7 @@ Known unsupported draft model types:
 To request support for a new model type, please open an issue at
 https://github.com/ml-explore/mlx-lm with the model architecture details.
 
-### Structured Output
+### Structured Output (xgrammar)
 
 Structured output requires the `--with-grammar` install flag which includes xgrammar. If
 you installed without this flag and need structured output, reinstall with:
@@ -356,6 +356,118 @@ you installed without this flag and need structured output, reinstall with:
 ```bash
 brew reinstall jundot/omlx/omlx --with-grammar
 ```
+
+The formula's `post_install` hook should fix xgrammar automatically. If structured output
+still fails after reinstalling with `--with-grammar`, apply the manual fix below.
+
+#### Detecting the Problem
+
+```bash
+# Run this with the OMLX libexec Python (not system Python)
+OMLX_PYTHON=$(brew --cellar omlx)/$(brew info --json omlx | python3 -c \
+  "import sys,json; v=json.load(sys.stdin)[0]['versions']['stable']; print(v)" 2>/dev/null || echo "HEAD-$(git -C $(brew --repo jundot/omlx) rev-parse --short HEAD)")
+${OMLX_PYTHON:-$(brew --cellar omlx)/HEAD-*/libexec/bin/python3.11} -c "import xgrammar; print('xgrammar OK')"
+```
+
+Common failure modes:
+
+| Error | Cause |
+|-------|-------|
+| `ModuleNotFoundError: No module named 'xgrammar'` | xgrammar not installed — reinstall with `--with-grammar` |
+| `Cannot find library: libxgrammar_bindings.dylib` | Missing RECORD file in xgrammar dist-info |
+| `Library not loaded: @rpath/libtvm_ffi.dylib` | Missing rpath in libxgrammar_bindings.dylib |
+| `Killed: 9` on import | SIP killed an unsigned dylib |
+
+#### Manual Fix
+
+If `brew reinstall --with-grammar` does not resolve the issue, apply all three steps:
+
+**Step 1 — Find your OMLX libexec path** (the path differs per version):
+
+```bash
+OMLX_CELLAR=$(ls -td /opt/homebrew/Cellar/omlx/HEAD-* 2>/dev/null | head -1 || \
+              ls -td /opt/homebrew/Cellar/omlx/*/ 2>/dev/null | tail -1)
+SITE_PACKAGES="${OMLX_CELLAR}libexec/lib/python3.11/site-packages"
+echo "Site packages: $SITE_PACKAGES"
+```
+
+**Step 2 — Create the missing RECORD file:**
+
+```bash
+SITE="$SITE_PACKAGES"   # from step 1
+cd "$SITE"
+
+# Build RECORD entries for all files in xgrammar/ and xgrammar-*.dist-info/
+{
+  for f in $(find xgrammar -type f | grep -v "\\.dSYM" | sort); do
+    size=$(wc -c < "$f" | tr -d ' ')
+    echo "$f,$size,"
+  done
+  for f in $(find xgrammar-*.dist-info -type f | sort); do
+    size=$(wc -c < "$f" | tr -d ' ')
+    echo "$f,$size,"
+  done
+} > "xgrammar-*.dist-info/RECORD"
+```
+
+**Step 3 — Fix dylib load paths and re-sign:**
+
+```bash
+SITE="$SITE_PACKAGES"   # from step 1
+
+# Add @loader_path rpaths so both dylibs can find each other at runtime
+install_name_tool -add_rpath "@loader_path/" \
+  "$SITE/xgrammar/libxgrammar_bindings.dylib"
+install_name_tool -add_rpath "@loader_path/../tvm_ffi/lib/" \
+  "$SITE/xgrammar/libxgrammar_bindings.dylib"
+install_name_tool -add_rpath "@loader_path/" \
+  "$SITE/tvm_ffi/lib/libtvm_ffi.dylib"
+
+# Re-sign both dylibs — SIP kills unsigned dylibs with SIGKILL
+codesign -f -s - "$SITE/xgrammar/libxgrammar_bindings.dylib"
+codesign -f -s - "$SITE/tvm_ffi/lib/libtvm_ffi.dylib"
+```
+
+**Step 4 — Patch `load_binding.py` for DYLD_LIBRARY_PATH fallback** (required on some macOS versions):
+
+```bash
+SITE="$SITE_PACKAGES"   # from step 1
+
+# Prepend DYLD_LIBRARY_PATH to xgrammar's dylib loader
+cat > /tmp/xgrammar_fix.py << 'EOF'
+import pathlib, sys
+load_binding = pathlib.Path("SITE/xgrammar/load_binding.py")
+content = load_binding.read_text()
+patch = '''
+import os, pathlib as _pp
+_xg_root = _pp.Path(__file__).parent.parent
+_tvm_root = _xg_root / "tvm_ffi"
+_lib_dir = str(_tvm_root / "lib")
+_dylib_dir = str(_xg_root / "xgrammar")
+_existing = os.environ.get("DYLD_LIBRARY_PATH", "")
+_parts = [p for p in [_lib_dir, _dylib_dir, _existing] if p]
+os.environ["DYLD_LIBRARY_PATH"] = ":".join(_parts)
+'''
+if "DYLD_LIBRARY_PATH" not in content:
+    load_binding.write_text(patch.strip() + "\\n" + content)
+    print("Patched load_binding.py")
+else:
+    print("load_binding.py already patched")
+EOF
+python3 /tmp/xgrammar_fix.py
+```
+
+**Verify the fix:**
+
+```bash
+OMLX_PYTHON=$(ls -td /opt/homebrew/Cellar/omlx/HEAD-* 2>/dev/null | head -1)/libexec/bin/python3.11
+$OMLX_PYTHON -c "import xgrammar; print('xgrammar OK — structured output ready')"
+```
+
+> **Note:** The manual fix lives in Homebrew's Cellar directory. Running `brew upgrade omlx`
+> reinstalls OMLX and overwrites these changes. After every upgrade, re-run
+> `brew reinstall jundot/omlx/omlx --with-grammar` to apply the formula's official fix.
+> If that still fails, repeat the steps above.
 
 ## Development
 
